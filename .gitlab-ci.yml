@@ -1,0 +1,181 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: always
+
+variables:
+  SERVICE_NAME: "cms-frontend"
+  IMAGE_LATEST: "${CI_REGISTRY_IMAGE}/${PROJECT_NAME}-${PROJECT_ENV}-${SERVICE_NAME}-service:latest"
+  VALUES_FILE: "${CI_PROJECT_DIR}/sisal-argocd-apps/${PROJECT_ENV}/cms-only/values.yaml"
+  SECRETS_FILE: "${CI_PROJECT_DIR}/deployment/${PROJECT_ENV}/secrets.yaml"
+  VARIABLES_FILE: "${CI_PROJECT_DIR}/deployment/${PROJECT_ENV}/variables.yaml"
+
+
+stages:
+  - build
+  - deploy
+  - update-secrets
+  - update-version-service-confluence
+  - update-version-tag-confluence
+
+.update_vars: &update_vars |
+  variables_length=$(yq e '.variables | length' ${VARIABLES_FILE})
+  secrets_length=$(yq e '.secrets | length' ${SECRETS_FILE})
+
+  pathEnv=".cms-only.${SERVICE_NAME}-service.env" yq e 'eval(strenv(pathEnv)) = {}' ${VALUES_FILE} > $$$.tmp && mv $$$.tmp ${VALUES_FILE}
+
+  if [ $variables_length -gt 0 ] ; then
+      for element_index in `seq 0 $(expr $variables_length - 1)`;do
+          export NAME=`yq e ".variables[$element_index].name" ${VARIABLES_FILE}`
+          if [[ "${NAME}" == "SERVICE_VERSION" ]] ; then
+              export VALUE=${SERVICE_VERSION}
+          else
+              export VALUE=`yq e ".variables[$element_index].value" ${VARIABLES_FILE}`
+          fi
+          pathEnv=".cms-only.${SERVICE_NAME}-service.env" yq e -P 'eval(strenv(pathEnv)) |= ({env(NAME): strenv(VALUE)} + .)' ${VALUES_FILE} > $$$.tmp && mv $$$.tmp ${VALUES_FILE}
+      done
+  fi
+
+build:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.9.0-debug
+    entrypoint: [""]
+  environment:
+    name: $CI_COMMIT_BRANCH
+  script:
+    # - mv .env.example .env
+    - export SERVICE_VERSION=$(cat version)
+    - export IMAGE="${CI_REGISTRY_IMAGE}/${PROJECT_NAME}-${PROJECT_ENV}-${SERVICE_NAME}-service:${SERVICE_VERSION}"
+    - |
+      if [ "${PROJECT_ENV}" != "uat" ] ; then 
+        sed -i "s/ubuntu/docker-registry.gameloft.org\/g4b_be\/sisal\/sisal-base-images\/ubuntu/" ${CI_PROJECT_DIR}/Dockerfile ; 
+      fi  
+    - /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/Dockerfile"
+      --destination "${IMAGE}"
+      --destination "${IMAGE_LATEST}"
+  only:
+    - alpha
+    - beta
+    - qualif
+
+deploy:
+  stage: deploy
+  image: alpine:3.16
+  environment:
+    name: $CI_COMMIT_BRANCH
+  script:
+    - export SERVICE_VERSION=$(cat version)
+    - export IMAGE="${CI_REGISTRY_IMAGE}/${PROJECT_NAME}-${PROJECT_ENV}-${SERVICE_NAME}-service:${SERVICE_VERSION}"
+    - apk add --no-cache git bash yq
+    - git config --global user.email "${G4B_GIT_USER}@gameloft.com"
+    - git config --global user.name "${G4B_GIT_USER}"
+    - git clone https://${G4B_GIT_USER}:${G4B_GIT_TOKEN}@git.gameloft.org/g4b_be/sisal/sisal-argocd-apps.git
+    - cd sisal-argocd-apps
+    - *update_vars
+    - pathTagEnv=".cms-only.${SERVICE_NAME}-service.image.tag" yq e 'eval(strenv(pathTagEnv)) = strenv(SERVICE_VERSION)' ${VALUES_FILE} > $$$.tmp && mv $$$.tmp ${VALUES_FILE}
+    - git add --all
+    - git commit -m "update ${SERVICE_NAME}-service image to ${SERVICE_VERSION}" 
+    - git push -f origin master
+  only:
+    - alpha
+    - beta
+    - qualif
+
+update-secrets:
+  stage: update-secrets
+  image: 
+    name: docker-registry.gameloft.org/g4b_be/sisal/sisal-base-images/sisal-microservice-secrets:latest
+    entrypoint: [""]
+  environment:
+    name: $CI_COMMIT_BRANCH
+  script:
+    - /executor/sisal ${PROJECT_ENV} ${SERVICE_NAME}
+  only:
+    - alpha
+    - beta
+    - qualif
+
+build-sisal:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.9.0-debug
+    entrypoint: [""]
+  environment:
+    name: $CI_COMMIT_BRANCH
+  before_script:
+    - echo "{\"auths\":{\"$SISAL_CI_REGISTRY\":{\"auth\":\"$(printf "%s:%s" "${SISAL_REPO_USERNAME}" "${SISAL_REPO_TOKEN}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+  script:
+    - export SERVICE_VERSION=$(cat version)
+    - /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/Dockerfile"
+      --destination "lin.ocir.io/sisalspa/images/sfc-test/${SERVICE_NAME}-service:${SERVICE_VERSION}"
+  only:
+    - uat
+
+deploy-sisal:
+  stage: deploy
+  image: 
+    name: docker-registry.gameloft.org/g4b_be/sisal/sisal-base-images/sisal-deploy-uat:latest
+    entrypoint: [""]
+  environment:
+    name: $CI_COMMIT_BRANCH
+  script:
+    - export SERVICE_VERSION=$(cat version)
+    - /executor/sisal ${SERVICE_NAME} ${SERVICE_VERSION} 
+    - if [[ ${SERVICE_VERSION::1} == "v" ]] ; then export TAG=$SERVICE_VERSION; else export TAG="v${SERVICE_VERSION}" ; fi
+    - git config --global user.email "${G4B_GIT_USER}@gameloft.com"
+    - git config --global user.name "${G4B_GIT_USER}"
+    - git tag | xargs git tag -d
+    - git tag "$TAG"
+    - git push --tags https://$G4B_GIT_USER:$G4B_GIT_TOKEN@$CI_SERVER_HOST/$CI_PROJECT_PATH.git
+  only:
+    - uat
+
+update-version-service-confluence:
+  stage: update-version-service-confluence
+  environment:
+    name: $CI_COMMIT_BRANCH
+  image:
+    name: python:latest
+  script:
+    - apt-get update && apt-get install jq -y
+    - export SERVICE_VERSION=$(cat version)
+    - export PROJECT_ENV=$(echo "${PROJECT_ENV^}")
+    - git config --global user.email "${G4B_GIT_USER}@gameloft.com"
+    - git config --global user.name "${G4B_GIT_USER}"
+    - git clone https://${G4B_GIT_USER}:${G4B_GIT_TOKEN}@git.gameloft.org/g4b_be/sisal-gameloft/sisal-update-version-microservices-in-confluence.git
+    - cd sisal-update-version-microservices-in-confluence
+    - JSON="{\"first_column\":\"${SERVICE_NAME}-service\",\"header\":\"$PROJECT_ENV\",\"replace_with\":\"$SERVICE_VERSION\"}"
+    - jq --argjson json $JSON '.table_0 += $json' setup/vars.json > tmp.$$.json && mv tmp.$$.json setup/vars.json
+    - cat setup/vars.json
+    - pip install requests > /dev/null
+    - pip install bs4 > /dev/null
+    - python ./src/main.py
+
+update-version-tag-confluence:
+  stage: update-version-tag-confluence
+  environment:
+    name: $CI_COMMIT_BRANCH
+  image:
+    name: python:latest
+  script:
+    - apt-get update && apt-get install jq -y
+    - export SERVICE_VERSION=$(cat version)
+    - export PROJECT_ENV=$(echo "${PROJECT_ENV^}")
+    - git config --global user.email "${G4B_GIT_USER}@gameloft.com"
+    - git config --global user.name "${G4B_GIT_USER}"
+    - git clone https://${G4B_GIT_USER}:${G4B_GIT_TOKEN}@git.gameloft.org/g4b_be/sisal-gameloft/sisal-update-version-microservices-in-confluence.git
+    - cd sisal-update-version-microservices-in-confluence
+    - JSON="{\"first_column\":\"${SERVICE_NAME}-service\",\"header\":\"Sisal-Tag\",\"replace_with\":\"https://git-digital.sisal.it/sisalfunclub/${SERVICE_NAME}-service/tree/v${SERVICE_VERSION}\"}"
+    - jq --argjson json $JSON '.table_0 += $json' setup/vars.json > tmp.$$.json && mv tmp.$$.json setup/vars.json
+    - cat setup/vars.json
+    - pip install requests > /dev/null
+    - pip install bs4 > /dev/null    
+    - python ./src/main.py
+  only:
+    - uat

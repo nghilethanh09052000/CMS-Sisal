@@ -1,0 +1,11 @@
+variables:
+  - name: PUBLIC_URL
+    value: "/cms"
+  - name: REACT_APP_ENV
+    value: "alpha"
+  - name: REACT_APP_CMS_USER_URL
+    value: "https://funclub.sisal-alpha.g4b.gameloft.com/cms-user/cms"
+  - name: REACT_APP_REMOTE_CONFIG_URL
+    value: "https://funclub.sisal-alpha.g4b.gameloft.com/remote-config/cms"
+  - name: REACT_APP_SUPPORT_NON_AD_USERS
+    value: "true"
